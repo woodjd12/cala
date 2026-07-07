@@ -73,6 +73,7 @@ impl AccountControls {
             }
             velocity_limits.push(AccountVelocityLimit {
                 limit_id: velocity.id,
+                limit_name: Some(velocity.name),
                 window: velocity.window,
                 condition: velocity.condition,
                 currency: velocity.currency,

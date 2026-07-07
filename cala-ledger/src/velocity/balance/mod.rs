@@ -214,6 +214,7 @@ mod tests {
         fn dummy_test_limit() -> AccountVelocityLimit {
             AccountVelocityLimit {
                 limit_id: VelocityLimitId::new(),
+                limit_name: Some("dummy-limit".to_string()),
                 window: Default::default(),
                 condition: None,
                 currency: None,
@@ -501,6 +502,7 @@ mod tests {
 
             let limit = AccountVelocityLimit {
                 limit_id: key.limit_id,
+                limit_name: Some("test-limit".to_string()),
                 window: Default::default(),
                 condition: None,
                 currency: None,
@@ -536,7 +538,13 @@ mod tests {
                 current_balances,
                 &entries_to_add,
             );
-            assert!(matches!(result, Err(VelocityError::Enforcement(_))));
+            match result {
+                Err(VelocityError::Enforcement(err)) => {
+                    assert_eq!(err.limit_id, key.limit_id);
+                    assert_eq!(err.limit_name.as_deref(), Some("test-limit"));
+                }
+                _ => panic!("expected enforcement error"),
+            }
         }
     }
 }

@@ -38,6 +38,8 @@ impl AccountVelocityControl {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AccountVelocityLimit {
     pub limit_id: VelocityLimitId,
+    #[serde(default)]
+    pub limit_name: Option<String>,
     pub window: Vec<PartitionKey>,
     pub condition: Option<CelExpression>,
     pub currency: Option<Currency>,
@@ -73,7 +75,7 @@ impl AccountVelocityLimit {
         Ok(Some(map.into()))
     }
 
-    #[instrument(name = "velocity_limit.enforce", skip(self, ctx, snapshot), fields(limit_id = %self.limit_id, account_id = %snapshot.account_id, currency = %snapshot.currency, velocity.limit, velocity.requested, velocity.layer, velocity.direction), err(level = tracing::Level::WARN))]
+    #[instrument(name = "velocity_limit.enforce", skip(self, ctx, snapshot), fields(limit_id = %self.limit_id, limit_name = self.limit_name.as_deref().unwrap_or("<unnamed>"), account_id = %snapshot.account_id, currency = %snapshot.currency, velocity.limit, velocity.requested, velocity.layer, velocity.direction), err(level = tracing::Level::WARN))]
     pub fn enforce(
         &self,
         ctx: &CelContext,
@@ -109,6 +111,7 @@ impl AccountVelocityLimit {
                     currency: snapshot.currency,
                     direction: limit.enforcement_direction,
                     limit_id: self.limit_id,
+                    limit_name: self.limit_name.clone(),
                     layer: limit.layer,
                     limit: limit.amount,
                     requested,
@@ -196,6 +199,7 @@ mod tests {
     fn limit_needs_enforcement_when_no_condition_given() {
         let limit = AccountVelocityLimit {
             limit_id: VelocityLimitId::new(),
+            limit_name: Some("test-limit".to_string()),
             window: vec![],
             condition: None,
             currency: None,
@@ -216,6 +220,7 @@ mod tests {
     fn limit_does_not_need_enforcement_when_currency_does_not_match() {
         let limit = AccountVelocityLimit {
             limit_id: VelocityLimitId::new(),
+            limit_name: Some("test-limit".to_string()),
             window: vec![],
             condition: None,
             currency: Some("EUR".parse().unwrap()),
@@ -242,6 +247,7 @@ mod tests {
     fn limit_needs_enforcement_when_condition_is_true() {
         let mut limit = AccountVelocityLimit {
             limit_id: VelocityLimitId::new(),
+            limit_name: Some("test-limit".to_string()),
             window: vec![],
             currency: None,
             condition: Some("true".parse().unwrap()),
@@ -267,6 +273,7 @@ mod tests {
     fn limit_interpolates_window() {
         let limit = AccountVelocityLimit {
             limit_id: VelocityLimitId::new(),
+            limit_name: Some("test-limit".to_string()),
             window: vec![
                 PartitionKey {
                     alias: "entry_type".to_string(),
@@ -303,6 +310,7 @@ mod tests {
         let time = Utc::now();
         let limit = AccountVelocityLimit {
             limit_id: VelocityLimitId::new(),
+            limit_name: Some("test-limit".to_string()),
             window: vec![],
             currency: None,
             condition: None,
@@ -337,6 +345,7 @@ mod tests {
         let time = Utc::now();
         let limit = AccountVelocityLimit {
             limit_id: VelocityLimitId::new(),
+            limit_name: Some("test-limit".to_string()),
             window: vec![],
             currency: Some("EUR".parse().unwrap()),
             condition: None,
@@ -364,6 +373,7 @@ mod tests {
         let time = Utc::now();
         let limit = AccountVelocityLimit {
             limit_id: VelocityLimitId::new(),
+            limit_name: Some("test-limit".to_string()),
             window: vec![],
             currency: None,
             condition: None,
@@ -401,6 +411,7 @@ mod tests {
         let time = Utc::now();
         let limit = AccountVelocityLimit {
             limit_id: VelocityLimitId::new(),
+            limit_name: Some("test-limit".to_string()),
             window: vec![],
             currency: None,
             condition: None,
@@ -435,6 +446,7 @@ mod tests {
         let time = Utc::now();
         let limit = AccountVelocityLimit {
             limit_id: VelocityLimitId::new(),
+            limit_name: Some("test-limit".to_string()),
             window: vec![],
             currency: None,
             condition: None,
@@ -458,5 +470,64 @@ mod tests {
         let new_snapshot = crate::balance::Snapshots::new_snapshot(time, entry.account_id, &entry);
         let res = limit.enforce(&ctx, time, &new_snapshot);
         assert!(res.is_err());
+    }
+
+    #[test]
+    fn enforcement_error_reports_origin_details() {
+        let ctx = crate::cel_context::initialize(es_entity::clock::Clock::handle().clone());
+        let time = Utc::now();
+        let limit_id = VelocityLimitId::new();
+        let limit = AccountVelocityLimit {
+            limit_id,
+            limit_name: Some("daily-withdrawal".to_string()),
+            window: vec![],
+            currency: None,
+            condition: None,
+            limit: AccountLimit {
+                timestamp_source: None,
+                balance: vec![AccountBalanceLimit {
+                    layer: Layer::Settled,
+                    amount: Decimal::ONE,
+                    enforcement_direction: DebitOrCredit::Debit,
+                    start: time,
+                    end: None,
+                }],
+            },
+        };
+        let mut entry = entry();
+        entry.units = Decimal::ONE_HUNDRED;
+        let new_snapshot = crate::balance::Snapshots::new_snapshot(time, entry.account_id, &entry);
+        let err = match limit.enforce(&ctx, time, &new_snapshot) {
+            Err(VelocityError::Enforcement(err)) => err,
+            _ => panic!("expected enforcement error"),
+        };
+        assert_eq!(err.limit_id, limit_id);
+        assert_eq!(err.limit_name.as_deref(), Some("daily-withdrawal"));
+        assert_eq!(err.account_id, entry.account_id);
+        let msg = err.to_string();
+        assert!(msg.contains("daily-withdrawal"));
+        assert!(msg.contains(&limit_id.to_string()));
+        assert!(msg.contains(&entry.account_id.to_string()));
+        assert!(msg.contains("Limit: USD 1"));
+        assert!(msg.contains("Requested: USD 100"));
+    }
+
+    #[test]
+    fn deserializes_limits_persisted_before_limit_name_existed() {
+        // Attached controls are persisted as JSON; rows written before
+        // limit_name was added must still deserialize.
+        let json = serde_json::json!({
+            "limit_id": VelocityLimitId::new(),
+            "window": [],
+            "condition": null,
+            "currency": null,
+            "limit": {
+                "timestamp_source": null,
+                "balance": []
+            }
+        });
+        let limit: AccountVelocityLimit =
+            serde_json::from_value(json).expect("pre-existing rows must deserialize");
+        assert_eq!(limit.limit_name, None);
     }
 }

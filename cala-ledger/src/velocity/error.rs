@@ -107,11 +107,15 @@ impl From<VelocityLimitCreateError> for VelocityError {
 }
 
 #[derive(Error, Debug)]
-#[error("Velocity limit exceeded")]
+#[error(
+    "Velocity limit '{}' ({limit_id}) exceeded for account {account_id} - Limit: {currency} {limit}, Requested: {currency} {requested}, Layer: {layer:?}, Direction: {direction:?}",
+    self.limit_name.as_deref().unwrap_or("<unnamed>")
+)]
 pub struct LimitExceededError {
     pub account_id: AccountId,
     pub currency: Currency,
     pub limit_id: VelocityLimitId,
+    pub limit_name: Option<String>,
     pub layer: Layer,
     pub direction: DebitOrCredit,
     pub limit: Decimal,
