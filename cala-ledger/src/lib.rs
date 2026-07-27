@@ -135,6 +135,7 @@ pub mod balance;
 pub mod entry;
 pub mod journal;
 pub mod migrate;
+pub mod projector;
 pub mod transaction;
 pub mod tx_template;
 pub mod velocity;

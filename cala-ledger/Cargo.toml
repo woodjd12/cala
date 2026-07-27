@@ -26,6 +26,7 @@ es-entity = { workspace = true }
 job = { workspace = true }
 obix = { workspace = true }
 
+async-trait = { workspace = true }
 cached = { workspace = true }
 chrono = { workspace = true }
 derive_builder = { workspace = true }

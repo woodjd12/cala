@@ -1,9 +1,20 @@
 #![allow(dead_code)]
 use rand::distr::{Alphanumeric, SampleString};
 
+use std::time::Duration;
+
 use cala_ledger::{
-    account::*, account_set::NewAccountSet, journal::*, primitives::BalanceRollup, tx_template::*,
+    account::*,
+    account_set::NewAccountSet,
+    balance::{error::BalanceError, AccountBalance},
+    journal::*,
+    primitives::{AccountId, BalanceRollup, Currency, JournalId},
+    projector::{BalanceProjectorConfig, BalanceProjectorInit},
+    tx_template::*,
+    CalaLedger, CalaLedgerConfig,
 };
+use chrono::NaiveDate;
+use rust_decimal::Decimal;
 
 pub async fn init_pool() -> anyhow::Result<sqlx::PgPool> {
     init_pool_with(sqlx::postgres::PgPoolOptions::new()).await
@@ -19,6 +30,143 @@ pub async fn init_pool_with(
     use job::IncludeMigrations;
     sqlx::migrate!().include_job_migrations().run(&pool).await?;
     Ok(pool)
+}
+
+pub async fn outbox_head(pool: &sqlx::PgPool) -> anyhow::Result<i64> {
+    use sqlx::Row as _;
+    let row = sqlx::query(
+        "SELECT COALESCE(MAX(sequence), 0)::bigint AS head FROM cala_persistent_outbox_events",
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(row.try_get("head")?)
+}
+
+/// Initialize a `CalaLedger` with the balance projector flag set. The
+/// poller is tuned for cross-test handoff on a shared dev database, and
+/// the durable job's cursor is seeded at the current outbox head (test
+/// isolation, not production behaviour: each run tails only its own
+/// activity instead of replaying every other test's). Established
+/// cursors are left untouched.
+pub async fn init_cala_with_projector(
+    pool: sqlx::PgPool,
+    enabled: bool,
+) -> anyhow::Result<CalaLedger> {
+    if enabled {
+        seed_projector_cursor_at_head(&pool).await?;
+    }
+    let poller_config = job::JobPollerConfig {
+        job_lost_interval: Duration::from_secs(30),
+        pending_jobs_check_interval: Duration::from_secs(1),
+        ..Default::default()
+    };
+    let config = CalaLedgerConfig::builder()
+        .pool(pool)
+        .exec_migrations(false)
+        .ec_balance_projector(enabled)
+        .job_poller_config(poller_config)
+        .build()?;
+    Ok(CalaLedger::init(config).await?)
+}
+
+async fn seed_projector_cursor_at_head(pool: &sqlx::PgPool) -> anyhow::Result<()> {
+    let head = outbox_head(pool).await?;
+    let seed_config = CalaLedgerConfig::builder()
+        .pool(pool.clone())
+        .exec_migrations(false)
+        .build()?;
+    let seed_ledger = CalaLedger::init(seed_config).await?;
+    let mut jobs = job::Jobs::init(
+        job::JobSvcConfig::builder()
+            .pool(pool.clone())
+            .build()
+            .map_err(anyhow::Error::msg)?,
+    )
+    .await?;
+    let spawner = jobs.add_initializer(BalanceProjectorInit::new(&seed_ledger));
+    spawner
+        .spawn_unique(job::JobId::new(), BalanceProjectorConfig::default())
+        .await?;
+    sqlx::query(
+        "UPDATE job_executions SET execution_state_json = jsonb_build_object('sequence', $1::bigint) \
+         WHERE job_type = 'balance-projector' AND execution_state_json IS NULL",
+    )
+    .bind(head)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn wait_for_ec_convergence(
+    cala: &CalaLedger,
+    journal_id: JournalId,
+    account_id: impl Into<AccountId> + Copy,
+    currency: Currency,
+    expected_settled: Decimal,
+    timeout: Duration,
+) -> anyhow::Result<AccountBalance> {
+    let deadline = std::time::Instant::now() + timeout;
+    let mut last_seen: Option<Decimal> = None;
+    loop {
+        match cala
+            .balances()
+            .find(journal_id, account_id.into(), currency)
+            .await
+        {
+            Ok(balance) => {
+                if balance.settled() == expected_settled {
+                    return Ok(balance);
+                }
+                last_seen = Some(balance.settled());
+            }
+            Err(BalanceError::NotFound(..)) => {}
+            Err(e) => return Err(e.into()),
+        }
+        if std::time::Instant::now() > deadline {
+            anyhow::bail!(
+                "EC balance did not converge to {expected_settled} within {timeout:?} \
+                 (last seen: {last_seen:?})"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+pub async fn wait_for_ec_effective_convergence(
+    cala: &CalaLedger,
+    journal_id: JournalId,
+    account_id: impl Into<AccountId> + Copy,
+    currency: Currency,
+    date: NaiveDate,
+    expected_settled: Decimal,
+    timeout: Duration,
+) -> anyhow::Result<AccountBalance> {
+    let deadline = std::time::Instant::now() + timeout;
+    let mut last_seen: Option<Decimal> = None;
+    loop {
+        match cala
+            .balances()
+            .effective()
+            .find_cumulative(journal_id, account_id.into(), currency, date)
+            .await
+        {
+            Ok(balance) => {
+                if balance.settled() == expected_settled {
+                    return Ok(balance);
+                }
+                last_seen = Some(balance.settled());
+            }
+            Err(BalanceError::NotFound(..)) => {}
+            Err(e) => return Err(e.into()),
+        }
+        if std::time::Instant::now() > deadline {
+            anyhow::bail!(
+                "EC effective balance at {date} did not converge to {expected_settled} \
+                 within {timeout:?} (last seen: {last_seen:?})"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 pub fn test_journal() -> NewJournal {

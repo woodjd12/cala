@@ -35,6 +35,7 @@ pub struct CalaLedger {
     velocities: Velocities,
     balances: Balances,
     publisher: OutboxPublisher,
+    jobs: Option<job::Jobs>,
 }
 
 impl CalaLedger {
@@ -72,7 +73,7 @@ impl CalaLedger {
         let balances = Balances::new(&pool, &publisher, &journals);
         let velocities = Velocities::new(&pool, &clock);
         let account_sets = AccountSets::new(&pool, &publisher, &accounts, &balances, &clock);
-        Ok(Self {
+        let mut ledger = Self {
             accounts,
             account_sets,
             journals,
@@ -84,7 +85,52 @@ impl CalaLedger {
             velocities,
             pool,
             clock,
-        })
+            jobs: None,
+        };
+        if config.ec_balance_projector {
+            ledger.jobs = Some(
+                ledger
+                    .start_balance_projector(config.job_poller_config)
+                    .await?,
+            );
+        }
+        Ok(ledger)
+    }
+
+    /// Register the projector's initializer before polling starts (the
+    /// poller may claim the durable job the moment polling begins, and an
+    /// unregistered job type would error), ensure the unique job row exists
+    /// (idempotent across restarts), then start the poller.
+    async fn start_balance_projector(
+        &self,
+        poller_config: job::JobPollerConfig,
+    ) -> Result<job::Jobs, LedgerError> {
+        let job_config = job::JobSvcConfig::builder()
+            .pool(self.pool.clone())
+            .poller_config(poller_config)
+            .clock(self.clock.clone())
+            .build()
+            .map_err(LedgerError::ConfigError)?;
+        let mut jobs = job::Jobs::init(job_config).await?;
+        let spawner = jobs.add_initializer(crate::projector::BalanceProjectorInit::new(self));
+        spawner
+            .spawn_unique(
+                job::JobId::new(),
+                crate::projector::BalanceProjectorConfig::default(),
+            )
+            .await?;
+        jobs.start_poll().await?;
+        Ok(jobs)
+    }
+
+    /// Stop the hosted job runtime, signalling a running projector batch to
+    /// wind down; the durable job stays queued for the next `init`. A no-op
+    /// when the projector is not enabled, and safe to call repeatedly.
+    pub async fn shutdown(&self) -> Result<(), LedgerError> {
+        if let Some(jobs) = &self.jobs {
+            jobs.shutdown().await?;
+        }
+        Ok(())
     }
 
     pub fn pool(&self) -> &PgPool {

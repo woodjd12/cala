@@ -106,8 +106,9 @@ pub enum BalanceRollup {
     /// Rolled up inside every posting to a member account, under an
     /// exclusive lock per (journal, set, currency).
     Synchronous,
-    /// Skipped at posting time; refreshed by recalculating the sets
-    /// returned from `list_eventually_consistent_ids`.
+    /// Skipped at posting time and folded shortly afterwards by the
+    /// streaming balance projector (see `cala_ledger::projector`), so
+    /// reads lag posting by the projector's catch-up.
     EventuallyConsistent,
 }
 

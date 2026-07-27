@@ -931,75 +931,6 @@ impl EffectiveBalanceRepo {
 
     #[instrument(
         level = "debug",
-        name = "effective_balance.fetch_member_effective_history",
-        skip_all,
-        err(level = "warn")
-    )]
-    pub(super) async fn fetch_member_effective_history(
-        &self,
-        op: &mut impl es_entity::AtomicOperation,
-        journal_id: JournalId,
-        account_set_ids: &[AccountSetId],
-        min_watermark: Option<i64>,
-    ) -> Result<Vec<EffectiveMemberHistoryRow>, BalanceError> {
-        let rows = sqlx::query!(
-            r#"
-            WITH member_accounts AS (
-                SELECT DISTINCT m.member_account_id
-                FROM cala_account_set_member_accounts m
-                LEFT JOIN cala_account_sets s ON s.id = m.member_account_id
-                WHERE m.account_set_id = ANY($1)
-                  AND s.id IS NULL
-            ),
-            all_history AS (
-                SELECT h.values, h.account_id, h.currency, h.version, h.seq,
-                       t.effective AS effective_date
-                FROM cala_balance_history h
-                JOIN member_accounts ma ON ma.member_account_id = h.account_id
-                JOIN cala_entries e ON e.id = h.latest_entry_id
-                JOIN cala_transactions t ON t.id = e.transaction_id AND t.journal_id = $2
-                WHERE h.journal_id = $2
-            ),
-            with_prev AS (
-                SELECT values,
-                       LAG(values) OVER (
-                           PARTITION BY account_id, currency ORDER BY version
-                       ) as prev_values,
-                       seq, effective_date
-                FROM all_history
-            )
-            SELECT values, prev_values, effective_date
-            FROM with_prev
-            WHERE ($3::bigint IS NULL OR seq > $3)
-            ORDER BY effective_date, seq
-            "#,
-            account_set_ids as &[AccountSetId],
-            journal_id as JournalId,
-            min_watermark,
-        )
-        .fetch_all(op.as_executor())
-        .await?;
-
-        let mut result = Vec::with_capacity(rows.len());
-        for row in rows {
-            let snapshot: BalanceSnapshot =
-                serde_json::from_value(row.values).expect("Failed to deserialize balance snapshot");
-            let prev_snapshot: Option<BalanceSnapshot> = row.prev_values.map(|v| {
-                serde_json::from_value(v).expect("Failed to deserialize previous balance snapshot")
-            });
-
-            result.push(EffectiveMemberHistoryRow {
-                snapshot,
-                prev_snapshot,
-                effective_date: row.effective_date,
-            });
-        }
-
-        Ok(result)
-    }
-
-    #[instrument(
-        level = "debug",
         name = "effective_balance.fetch_effective_history_from_date",
         skip_all,
         err(level = "warn")
@@ -1149,14 +1080,14 @@ impl EffectiveBalanceRepo {
 
     #[instrument(
         level = "debug",
-        name = "effective_balance.insert_recalc_snapshots",
+        name = "effective_balance.insert_rebuild_snapshots",
         skip(self, op, snapshots)
     )]
-    pub(super) async fn insert_recalc_snapshots(
+    pub(super) async fn insert_rebuild_snapshots(
         &self,
         op: &mut impl es_entity::AtomicOperation,
         journal_id: JournalId,
-        snapshots: Vec<RecalcEffectiveSnapshot>,
+        snapshots: Vec<RebuiltEffectiveSnapshot>,
     ) -> Result<(), BalanceError> {
         let mut journal_ids = Vec::with_capacity(snapshots.len());
         let mut account_ids = Vec::with_capacity(snapshots.len());
@@ -1311,7 +1242,7 @@ pub(super) struct EffectiveMemberHistoryRow {
     pub(super) effective_date: NaiveDate,
 }
 
-pub(super) struct RecalcEffectiveSnapshot {
+pub(super) struct RebuiltEffectiveSnapshot {
     pub(super) account_id: AccountId,
     pub(super) currency: Currency,
     pub(super) effective_date: NaiveDate,

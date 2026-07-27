@@ -1,21 +1,12 @@
-//! Concurrent correctness test for the EC account set recalc <-> poster
-//! lock pair.
-//!
-//! Reproduces the bug where `nextval` ordering on `cala_balance_history.seq`
-//! does not match commit visibility ordering: a poster may have an
-//! uncommitted seq that is *smaller* than the seqs already visible to a
-//! concurrently running recalc. Without the lock pair, the recalc would
-//! advance its watermark past the uncommitted seq and silently skip the
-//! row when it later becomes visible.
-//!
-//! This test stresses the interleaving by spawning many writer tasks and
-//! many recalc tasks in parallel, then asserts that the EC set's balance
-//! equals the sum of all posted credits — both **without** a final recalc
-//! (incremental correctness) and **after** a final recalc (idempotency).
+//! Concurrent correctness tests for EC account-set balances under the
+//! streaming projector: many concurrent writer tasks run against a live
+//! projector, then the EC set must converge exactly to the sum of all
+//! posted credits, with no post dropped or double-folded.
 
 mod helpers;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use rand::distr::{Alphanumeric, SampleString};
 use rand::RngExt;
@@ -26,17 +17,18 @@ use cala_ledger::{account::*, account_set::*, balance::error::BalanceError, tx_t
 
 const N_MEMBERS: usize = 8;
 const N_WRITERS: usize = 8;
-const N_RECALCS: usize = 4;
 const N_ITERATIONS: usize = 4;
 const POSTS_PER_WRITER_PER_ITERATION: usize = 6;
 const POST_AMOUNT: Decimal = dec!(7);
+const CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[tokio::test]
-async fn ec_recalc_race_under_concurrency() -> anyhow::Result<()> {
+async fn ec_projector_race_under_concurrency() -> anyhow::Result<()> {
     let usd: Currency = "USD".parse().unwrap();
 
     // Use a larger pool than `helpers::init_pool`'s default so the
-    // concurrent writers + recalcs do not starve on connection acquisition.
+    // concurrent writers and the projector do not starve on connection
+    // acquisition.
     let pool = helpers::init_pool_with(
         sqlx::postgres::PgPoolOptions::new()
             .max_connections(40)
@@ -44,11 +36,7 @@ async fn ec_recalc_race_under_concurrency() -> anyhow::Result<()> {
     )
     .await?;
 
-    let cala_config = CalaLedgerConfig::builder()
-        .pool(pool)
-        .exec_migrations(false)
-        .build()?;
-    let cala = CalaLedger::init(cala_config).await?;
+    let cala = helpers::init_cala_with_projector(pool, true).await?;
 
     let journal = cala
         .journals()
@@ -103,10 +91,10 @@ async fn ec_recalc_race_under_concurrency() -> anyhow::Result<()> {
 
     let member_ids: Arc<Vec<AccountId>> = Arc::new(members.iter().map(|a| a.id()).collect());
 
-    // Run the bursty pattern several times so the interleaving has plenty
-    // of opportunities to expose a race.
+    // Run the bursty pattern several times so the projector consumes the
+    // stream while writers are actively posting, not just afterwards.
     for _ in 0..N_ITERATIONS {
-        let mut handles = Vec::with_capacity(N_WRITERS + N_RECALCS);
+        let mut handles = Vec::with_capacity(N_WRITERS);
 
         for _ in 0..N_WRITERS {
             let cala = cala.clone();
@@ -133,18 +121,6 @@ async fn ec_recalc_race_under_concurrency() -> anyhow::Result<()> {
             }));
         }
 
-        for _ in 0..N_RECALCS {
-            let cala = cala.clone();
-            let set_id = ec_set.id();
-            handles.push(tokio::spawn(async move {
-                cala.account_sets()
-                    .recalculate_balances(set_id)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("recalculate_balances failed: {e}"))?;
-                Ok::<_, anyhow::Error>(())
-            }));
-        }
-
         for h in handles {
             h.await??;
         }
@@ -153,50 +129,21 @@ async fn ec_recalc_race_under_concurrency() -> anyhow::Result<()> {
     let total_posts = N_ITERATIONS * N_WRITERS * POSTS_PER_WRITER_PER_ITERATION;
     let expected_total = POST_AMOUNT * Decimal::from(total_posts);
 
-    // (a) Without a final recalc — exercises that the in-flight recalcs
-    //     produced a balance that already covers every committed post.
-    //
-    // Note: a recalc that runs concurrently with a writer might miss the
-    // writer's last commit if the commit lands a few microseconds after
-    // the recalc has finished its read phase. The lock pair guarantees
-    // that no row is *permanently* skipped, but it does NOT guarantee
-    // that a recalc which started before a poster committed observes
-    // that poster. So in the no-final-recalc check we only assert that
-    // the EC set balance is consistent with *some* prefix of the posts —
-    // i.e. ≤ the expected total — and that the rows it does account for
-    // are present.
-    //
-    // The hard correctness check happens after the final recalc below.
-    let pre_final = cala.balances().find(journal.id(), ec_set.id(), usd).await?;
-    let pre_final_settled = pre_final.settled();
-    assert!(
-        pre_final_settled <= expected_total,
-        "EC set balance {pre_final_settled} exceeded expected total {expected_total}",
-    );
-
-    // (b) After a final recalc — every committed post must now be
-    //     reflected. This is the assertion that fails if the watermark
-    //     race lets a row slip through.
-    cala.account_sets()
-        .recalculate_balances(ec_set.id())
-        .await
-        .unwrap();
-
-    let final_bal = cala.balances().find(journal.id(), ec_set.id(), usd).await?;
-    assert_eq!(
-        final_bal.settled(),
+    // Every committed post must be reflected: fails if a post slips
+    // through or a batch is folded twice.
+    let final_bal = helpers::wait_for_ec_convergence(
+        &cala,
+        journal.id(),
+        ec_set.id(),
+        usd,
         expected_total,
-        "EC set balance after final recalc must equal sum of all posts \
-         (got {got}, expected {expected_total}, pre-final was {pre_final_settled})",
-        got = final_bal.settled(),
-    );
+        CONVERGENCE_TIMEOUT,
+    )
+    .await?;
 
-    // Cross-check by summing the member balances directly. This catches
-    // the case where the EC set balance happens to match the expected
-    // total but is internally inconsistent with the actual member state.
-    // Members that received zero posts have no balance row yet — only
-    // tolerate that specific NotFound case so a real failure does not
-    // get silently swallowed.
+    // Cross-check by summing the member balances directly. Members with
+    // zero posts have no balance row yet — only that NotFound is
+    // tolerated.
     let mut sum_members = Decimal::ZERO;
     for m in &members {
         match cala.balances().find(journal.id(), m.id(), usd).await {
@@ -215,39 +162,16 @@ async fn ec_recalc_race_under_concurrency() -> anyhow::Result<()> {
         "EC set balance must equal sum of member balances",
     );
 
-    // Idempotency: another final recalc must not change anything.
-    cala.account_sets()
-        .recalculate_balances(ec_set.id())
-        .await
-        .unwrap();
-    let final_bal_2 = cala.balances().find(journal.id(), ec_set.id(), usd).await?;
-    assert_eq!(
-        final_bal.settled(),
-        final_bal_2.settled(),
-        "recalculate_balances must be idempotent",
-    );
-    assert_eq!(
-        final_bal.details.version, final_bal_2.details.version,
-        "version must not change on idempotent recalc",
-    );
-
+    cala.shutdown().await?;
     Ok(())
 }
 
-/// Hierarchical variant of the race test.
-///
-/// Layout: `parent_set` (non-EC) ⊇ `ec_set` (EC) ⊇ `N` leaves.
-///
-/// When a poster writes to a leaf, `fetch_mappings_in_op` walks the
-/// transitive closure in `cala_account_set_member_accounts` and returns
-/// both `ec_set` and `parent_set` as owning sets. The poster therefore
-/// takes shared advisory locks on the full ancestor chain before its
-/// `nextval`, while concurrent recalcs on `ec_set` hold exclusive. This
-/// test exercises that protocol at depth > 1 and asserts that the
-/// non-EC ancestor (maintained synchronously by posters) and the
-/// inner EC set (maintained by recalcs) end up with identical balances.
+/// Hierarchical variant: `parent_set` (non-EC) ⊇ `ec_set` (EC) ⊇ `N`
+/// leaves. The non-EC parent is maintained synchronously by the poster
+/// while the inner EC set converges through the projector; both views of
+/// the same activity must agree exactly.
 #[tokio::test]
-async fn ec_recalc_hierarchy_race_under_concurrency() -> anyhow::Result<()> {
+async fn ec_projector_hierarchy_race_under_concurrency() -> anyhow::Result<()> {
     let usd: Currency = "USD".parse().unwrap();
 
     let pool = helpers::init_pool_with(
@@ -257,11 +181,7 @@ async fn ec_recalc_hierarchy_race_under_concurrency() -> anyhow::Result<()> {
     )
     .await?;
 
-    let cala_config = CalaLedgerConfig::builder()
-        .pool(pool)
-        .exec_migrations(false)
-        .build()?;
-    let cala = CalaLedger::init(cala_config).await?;
+    let cala = helpers::init_cala_with_projector(pool, true).await?;
 
     let journal = cala
         .journals()
@@ -290,7 +210,7 @@ async fn ec_recalc_hierarchy_race_under_concurrency() -> anyhow::Result<()> {
         members.push(cala.accounts().create(acc).await.unwrap());
     }
 
-    // Inner EC set: holds the leaves, rebuilt via recalc.
+    // Inner EC set: holds the leaves, converged by the projector.
     let ec_set = NewAccountSet::builder()
         .id(AccountSetId::new())
         .name("EC hierarchy inner set")
@@ -331,7 +251,7 @@ async fn ec_recalc_hierarchy_race_under_concurrency() -> anyhow::Result<()> {
     let member_ids: Arc<Vec<AccountId>> = Arc::new(members.iter().map(|a| a.id()).collect());
 
     for _ in 0..N_ITERATIONS {
-        let mut handles = Vec::with_capacity(N_WRITERS + N_RECALCS);
+        let mut handles = Vec::with_capacity(N_WRITERS);
 
         for _ in 0..N_WRITERS {
             let cala = cala.clone();
@@ -358,18 +278,6 @@ async fn ec_recalc_hierarchy_race_under_concurrency() -> anyhow::Result<()> {
             }));
         }
 
-        for _ in 0..N_RECALCS {
-            let cala = cala.clone();
-            let set_id = ec_set.id();
-            handles.push(tokio::spawn(async move {
-                cala.account_sets()
-                    .recalculate_balances(set_id)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("recalculate_balances failed: {e}"))?;
-                Ok::<_, anyhow::Error>(())
-            }));
-        }
-
         for h in handles {
             h.await??;
         }
@@ -379,7 +287,7 @@ async fn ec_recalc_hierarchy_race_under_concurrency() -> anyhow::Result<()> {
     let expected_total = POST_AMOUNT * Decimal::from(total_posts);
 
     // The non-EC parent is built synchronously by the poster path, so
-    // its balance must already equal the sum of all posts — no recalc
+    // its balance must already equal the sum of all posts — no projector
     // involved on this account at any point in the test.
     let parent_bal = cala
         .balances()
@@ -391,40 +299,29 @@ async fn ec_recalc_hierarchy_race_under_concurrency() -> anyhow::Result<()> {
         "non-EC parent balance must equal sum of all posts",
     );
 
-    // Final recalc on the inner EC set. Every committed post must be
-    // reflected afterwards — this is the assertion that would fail if
-    // the ancestor-chain shared lock did not cover the full closure.
-    cala.account_sets()
-        .recalculate_balances(ec_set.id())
-        .await
-        .unwrap();
-
-    let ec_bal = cala.balances().find(journal.id(), ec_set.id(), usd).await?;
-    assert_eq!(
-        ec_bal.settled(),
+    // The inner EC set converges to the same total through the projector.
+    let ec_bal = helpers::wait_for_ec_convergence(
+        &cala,
+        journal.id(),
+        ec_set.id(),
+        usd,
         expected_total,
-        "inner EC set balance after final recalc must equal sum of all posts",
-    );
+        CONVERGENCE_TIMEOUT,
+    )
+    .await?;
     assert_eq!(
         parent_bal.settled(),
         ec_bal.settled(),
         "non-EC parent and inner EC set balances must agree",
     );
 
+    cala.shutdown().await?;
     Ok(())
 }
 
 /// Concurrent multi-call `add_member_in_op` transactions on a shared
-/// pool of EC parent sets, interleaved with posters on leaves that
-/// those parents contain, must not deadlock.
-///
-/// Shape: `N_TASKS` tokio tasks each open a transaction and do
-/// `ADDS_PER_TASK` `add_member_in_op` calls against the parents in
-/// a randomised order (so different transactions accumulate
-/// membership writes against the same parents in different orders).
-/// `N_POSTERS` poster tasks concurrently post to a single hot leaf
-/// that is a direct member of every parent, so each poster's
-/// `find_for_update` call takes SHARED on every parent in one go.
+/// pool of EC parent sets, interleaved with posters on a hot leaf those
+/// parents contain, must not deadlock.
 #[tokio::test]
 async fn add_member_multi_call_no_deadlock_with_posters() -> anyhow::Result<()> {
     const N_TASKS: usize = 6;
@@ -442,11 +339,7 @@ async fn add_member_multi_call_no_deadlock_with_posters() -> anyhow::Result<()> 
     )
     .await?;
 
-    let cala_config = CalaLedgerConfig::builder()
-        .pool(pool)
-        .exec_migrations(false)
-        .build()?;
-    let cala = CalaLedger::init(cala_config).await?;
+    let cala = helpers::init_cala_with_projector(pool, true).await?;
 
     let journal = cala
         .journals()
@@ -484,7 +377,6 @@ async fn add_member_multi_call_no_deadlock_with_posters() -> anyhow::Result<()> 
         parents.push(cala.account_sets().create(set).await.unwrap());
     }
 
-    // Pre-existing leaves that belong to every parent. The poster
     // One hot leaf that is a direct member of every parent set, so
     // a single poster's `find_for_update` call takes SHARED on every
     // parent at once.
@@ -509,13 +401,9 @@ async fn add_member_multi_call_no_deadlock_with_posters() -> anyhow::Result<()> 
     for iteration in 0..N_ITERATIONS {
         let mut handles = Vec::with_capacity(N_TASKS + N_POSTERS);
 
-        // Add_member tasks: each opens a transaction and does several
-        // `add_member_in_op` calls against the shared parent pool in
-        // a randomised order. The random ordering models real
-        // application callers that pick parents in their own order
-        // (not canonical UUID order), so concurrent transactions
-        // accumulate membership writes against the same parents in
-        // different orders.
+        // Each task opens a transaction and does several `add_member_in_op`
+        // calls against the shared parent pool in a randomised order, so
+        // concurrent transactions hit the same parents in different orders.
         for task_idx in 0..N_TASKS {
             let cala = cala.clone();
             let parent_ids = parent_ids.clone();
@@ -591,24 +479,27 @@ async fn add_member_multi_call_no_deadlock_with_posters() -> anyhow::Result<()> 
         }
     }
 
-    // After a recalc, every parent's balance should equal the hot
-    // leaf's balance (the hot leaf is the only direct leaf with any
-    // history under each parent).
-    cala.account_sets()
-        .recalculate_balances_batch(&parent_ids)
-        .await
-        .unwrap();
-
+    // Every parent converges to the hot leaf's balance (the hot leaf is
+    // the only direct leaf with any history under each parent).
     let leaf_bal = cala.balances().find(journal.id(), hot_leaf_id, usd).await?;
     for parent in &parents {
-        let parent_bal = cala.balances().find(journal.id(), parent.id(), usd).await?;
+        let parent_bal = helpers::wait_for_ec_convergence(
+            &cala,
+            journal.id(),
+            parent.id(),
+            usd,
+            leaf_bal.settled(),
+            CONVERGENCE_TIMEOUT,
+        )
+        .await?;
         assert_eq!(
             parent_bal.settled(),
             leaf_bal.settled(),
-            "parent {} balance should match the hot leaf after recalc",
+            "parent {} balance should match the hot leaf after convergence",
             parent.id(),
         );
     }
 
+    cala.shutdown().await?;
     Ok(())
 }

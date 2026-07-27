@@ -238,16 +238,10 @@ impl AccountSets {
     }
 
     /// Refuse the membership change if `member_id` already has any
-    /// `cala_balance_history` row in `journal_id`. Folding existing
-    /// balance into a parent set after the fact is unsafe under
-    /// concurrent posters and EC recalcs (the watermark advance can leap
-    /// past unprocessed history of *other* members), and the symmetric
-    /// remove case has no safe unfold path either, so we forbid both.
-    ///
-    /// The check itself is run under exclusive locks on the parent set
-    /// and the candidate member in the EC-set lock namespace, so the
-    /// existence query reflects committed state even with concurrent
-    /// posters in flight.
+    /// `cala_balance_history` row in `journal_id`: a member joining with
+    /// history behind it would have to be folded into the parent after the
+    /// fact, and the symmetric remove case has no safe unfold path. Runs
+    /// under advisory locks so the check sees committed state.
     async fn assert_member_history_empty_in_op(
         &self,
         op: &mut impl es_entity::AtomicOperation,
@@ -541,166 +535,8 @@ impl AccountSets {
             .await
     }
 
-    #[instrument(name = "cala_ledger.account_sets.recalculate_balances", skip(self))]
-    pub async fn recalculate_balances(
-        &self,
-        account_set_id: AccountSetId,
-    ) -> Result<(), AccountSetError> {
-        let mut op = self.repo.begin_op_with_clock(&self.clock).await?;
-        self.recalculate_balances_in_op(&mut op, account_set_id)
-            .await?;
-        op.commit().await?;
-        Ok(())
-    }
-
-    #[instrument(
-        name = "cala_ledger.account_sets.recalculate_balances_in_op",
-        skip(self, op)
-    )]
-    pub async fn recalculate_balances_in_op(
-        &self,
-        op: &mut impl es_entity::AtomicOperation,
-        account_set_id: AccountSetId,
-    ) -> Result<(), AccountSetError> {
-        self.recalculate_balances_batch_in_op(op, &[account_set_id])
-            .await
-    }
-
-    #[instrument(
-        name = "cala_ledger.account_sets.recalculate_balances_batch",
-        skip(self, account_set_ids),
-        fields(account_set_ids_count = account_set_ids.len())
-    )]
-    pub async fn recalculate_balances_batch(
-        &self,
-        account_set_ids: &[AccountSetId],
-    ) -> Result<(), AccountSetError> {
-        let mut op = self.repo.begin_op_with_clock(&self.clock).await?;
-        self.recalculate_balances_batch_in_op(&mut op, account_set_ids)
-            .await?;
-        op.commit().await?;
-        Ok(())
-    }
-
-    #[instrument(
-        name = "cala_ledger.account_sets.recalculate_balances_batch_in_op",
-        skip(self, op, account_set_ids),
-        fields(account_set_ids_count = account_set_ids.len())
-    )]
-    pub async fn recalculate_balances_batch_in_op(
-        &self,
-        op: &mut impl es_entity::AtomicOperation,
-        account_set_ids: &[AccountSetId],
-    ) -> Result<(), AccountSetError> {
-        if account_set_ids.is_empty() {
-            return Ok(());
-        }
-
-        let sets = self
-            .repo
-            .find_all_in_op::<AccountSet>(&mut *op, account_set_ids)
-            .await?;
-
-        // Recalc is only meaningful for eventually-consistent account sets
-        // (non-EC sets are maintained inline by posters and recalculating
-        // them would race with within-batch `nextval` ordering on the
-        // watermark). Reject any non-EC input up front so callers fail
-        // loudly instead of silently risking a double-count.
-        let account_ids: Vec<AccountId> = account_set_ids.iter().map(AccountId::from).collect();
-        let accounts = self
-            .accounts
-            .find_all_in_op::<Account>(&mut *op, &account_ids)
-            .await?;
-
-        let mut journal_id: Option<JournalId> = None;
-        for id in account_set_ids {
-            let set = sets.get(id).ok_or(AccountSetError::CouldNotFindById(*id))?;
-            let jid = set.values().journal_id;
-            if let Some(expected) = journal_id {
-                if jid != expected {
-                    return Err(AccountSetError::JournalIdMismatch);
-                }
-            } else {
-                journal_id = Some(jid);
-            }
-
-            let account = accounts
-                .get(&AccountId::from(id))
-                .ok_or(AccountSetError::CouldNotFindById(*id))?;
-            if !account.values().config.eventually_consistent {
-                return Err(AccountSetError::CannotRecalculateNonEcSet {
-                    account_set_id: *id,
-                });
-            }
-        }
-
-        let journal_id = journal_id.expect("account_set_ids is non-empty");
-        self.balances
-            .recalculate_account_set_balances_batch_in_op(op, journal_id, account_set_ids)
-            .await?;
-        Ok(())
-    }
-
-    /// Recalculate balances for the given account sets **and** all their
-    /// descendant account sets in a single batch.
-    #[instrument(
-        name = "cala_ledger.account_sets.recalculate_balances_deep",
-        skip(self, account_set_ids),
-        fields(account_set_ids_count = account_set_ids.len())
-    )]
-    pub async fn recalculate_balances_deep(
-        &self,
-        account_set_ids: &[AccountSetId],
-    ) -> Result<(), AccountSetError> {
-        let mut op = self.repo.begin_op_with_clock(&self.clock).await?;
-        self.recalculate_balances_deep_in_op(&mut op, account_set_ids)
-            .await?;
-        op.commit().await?;
-        Ok(())
-    }
-
-    #[instrument(
-        name = "cala_ledger.account_sets.recalculate_balances_deep_in_op",
-        skip(self, op, account_set_ids),
-        fields(account_set_ids_count = account_set_ids.len())
-    )]
-    pub async fn recalculate_balances_deep_in_op(
-        &self,
-        op: &mut impl es_entity::AtomicOperation,
-        account_set_ids: &[AccountSetId],
-    ) -> Result<(), AccountSetError> {
-        if account_set_ids.is_empty() {
-            return Ok(());
-        }
-
-        // Only walk EC descendants — non-EC descendants are maintained
-        // inline by posters and recalc on them is rejected by
-        // `recalculate_balances_batch_in_op`. Filtering them out here
-        // means a deep walk on a hierarchy that mixes EC and non-EC sets
-        // simply skips the non-EC nodes, instead of erroring.
-        let descendants = self
-            .repo
-            .find_all_ec_descendant_set_ids(&mut *op, account_set_ids)
-            .await?;
-
-        let mut seen: std::collections::HashSet<AccountSetId> =
-            account_set_ids.iter().copied().collect();
-        let mut all_ids: Vec<AccountSetId> = account_set_ids.to_vec();
-        for id in descendants {
-            if seen.insert(id) {
-                all_ids.push(id);
-            }
-        }
-
-        self.recalculate_balances_batch_in_op(op, &all_ids).await
-    }
-
     /// List the ids of all account sets that are marked as
     /// `eventually_consistent`.
-    ///
-    /// Intended as a building block for periodic reconciliation jobs that need
-    /// to batch-recalculate balances for EC account sets (e.g. via
-    /// [`Self::recalculate_balances_deep`]).
     #[instrument(
         level = "debug",
         name = "cala_ledger.account_sets.list_eventually_consistent_ids",

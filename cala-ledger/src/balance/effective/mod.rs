@@ -193,40 +193,23 @@ impl EffectiveBalances {
         res
     }
 
+    /// Drop every cumulative snapshot of the given sets at or after
+    /// `min_effective_date` and replay them from member history. Cumulative
+    /// balances at a date depend on every earlier date, so a backdated
+    /// entry must rewrite all later dates; the replay is a pure function of
+    /// member history, making the rebuild idempotent under replay.
     #[instrument(
-        level = "debug",
-        name = "cala_ledger.balance.effective.recalculate_for_account_sets_in_op",
-        skip(self, op, account_set_ids, memberships),
-        fields(
-            account_set_ids_count = account_set_ids.len(),
-            memberships_count = memberships.len()
-        )
+        name = "cala_ledger.balance.effective.rebuild_for_account_sets_from_date_in_op",
+        skip(self, op, memberships)
     )]
-    pub(crate) async fn recalculate_for_account_sets_in_op(
+    pub(crate) async fn rebuild_for_account_sets_from_date_in_op(
         &self,
         op: &mut impl es_entity::AtomicOperation,
         journal_id: JournalId,
         account_set_ids: &[AccountSetId],
         memberships: &HashMap<AccountId, Vec<AccountSetId>>,
-        min_watermark: Option<i64>,
+        min_effective_date: NaiveDate,
     ) -> Result<(), BalanceError> {
-        // Phase 1: Use watermark-filtered query to discover the earliest effective
-        // date that has new (unprocessed) member history.
-        let new_history = self
-            .repo
-            .fetch_member_effective_history(&mut *op, journal_id, account_set_ids, min_watermark)
-            .await?;
-
-        if new_history.is_empty() {
-            return Ok(());
-        }
-
-        let min_effective_date = new_history
-            .iter()
-            .map(|r| r.effective_date)
-            .min()
-            .expect("history is non-empty");
-
         let set_account_ids: Vec<AccountId> = account_set_ids.iter().map(AccountId::from).collect();
 
         self.repo
@@ -238,9 +221,8 @@ impl EffectiveBalances {
             .load_latest_before(&mut *op, journal_id, &set_account_ids, min_effective_date)
             .await?;
 
-        // Phase 2: Fetch ALL member history from min_effective_date onward
-        // (regardless of watermark). This ensures we rebuild effective balances
-        // for later dates that may have been deleted above.
+        // All member history from min_effective_date onward: the delete
+        // above dropped every snapshot at or after that date.
         let full_history = self
             .repo
             .fetch_effective_history_from_date(
@@ -261,7 +243,7 @@ impl EffectiveBalances {
 
         if !snapshots.is_empty() {
             self.repo
-                .insert_recalc_snapshots(op, journal_id, snapshots)
+                .insert_rebuild_snapshots(op, journal_id, snapshots)
                 .await?;
         }
 
@@ -279,7 +261,7 @@ impl EffectiveBalances {
         memberships: &HashMap<AccountId, Vec<AccountSetId>>,
         history: Vec<EffectiveMemberHistoryRow>,
         base_snapshots: HashMap<(AccountId, Currency), LatestBeforeEntry>,
-    ) -> Vec<RecalcEffectiveSnapshot> {
+    ) -> Vec<RebuiltEffectiveSnapshot> {
         use rust_decimal::Decimal;
 
         let set_ids: HashSet<&AccountSetId> = account_set_ids.iter().collect();
@@ -403,7 +385,7 @@ impl EffectiveBalances {
 
                 state.all_time_version += 1;
 
-                result.push(RecalcEffectiveSnapshot {
+                result.push(RebuiltEffectiveSnapshot {
                     account_id,
                     currency: row.snapshot.currency,
                     effective_date: row.effective_date,

@@ -1,0 +1,12 @@
+# The balance projector consumes one global outbox stream with one durable
+# cursor, so tests that fold EC balances (live job or direct-runner batches)
+# would double-fold each other's sets if they ran concurrently against the
+# shared dev database. Every such test lives in the `projector` or
+# `projector_race` binary; serialize those two binaries and leave the rest
+# of the suite parallel.
+[test-groups]
+projector = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = 'binary(projector) or binary(projector_race)'
+test-group = 'projector'

@@ -93,6 +93,15 @@ impl Transactions {
     ) -> Result<HashMap<TransactionId, T>, TransactionError> {
         Ok(self.repo.find_all(transaction_ids).await?)
     }
+
+    #[instrument(name = "cala_ledger.transactions.find_all_in_op", skip(self, op))]
+    pub(crate) async fn find_all_in_op<T: From<Transaction>>(
+        &self,
+        op: &mut impl es_entity::AtomicOperation,
+        transaction_ids: &[TransactionId],
+    ) -> Result<HashMap<TransactionId, T>, TransactionError> {
+        Ok(self.repo.find_all_in_op(op, transaction_ids).await?)
+    }
 }
 
 impl From<&TransactionEvent> for OutboxEventPayload {

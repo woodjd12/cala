@@ -14,6 +14,20 @@ pub struct CalaLedgerConfig {
     pub(super) pool: Option<sqlx::PgPool>,
     #[builder(setter(into), default = "Clock::handle().clone()")]
     pub(super) clock: ClockHandle,
+    /// Have cala host the streaming balance projector in a job runtime it
+    /// owns. EC account sets are maintained only by the projector (see
+    /// [`crate::projector`]), so exactly one must run somewhere: with
+    /// `true` cala spawns it into its own [`job::Jobs`] runtime at init
+    /// (requires the `job` crate's tables); with `false` (default) the
+    /// embedder registers
+    /// [`BalanceProjectorInit`](crate::projector::BalanceProjectorInit)
+    /// in a runtime it already owns.
+    #[builder(default)]
+    pub(super) ec_balance_projector: bool,
+    /// Poller tuning for the job runtime cala hosts; only read when
+    /// `ec_balance_projector` is enabled.
+    #[builder(default)]
+    pub(super) job_poller_config: job::JobPollerConfig,
 }
 
 impl CalaLedgerConfig {
